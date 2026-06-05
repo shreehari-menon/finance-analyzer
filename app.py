@@ -175,63 +175,128 @@ def compute_rolling_stats(prices: pd.DataFrame) -> pd.DataFrame:
     df["Alert"]      = (df["Close"] > df["Upper2"]) | (df["Close"] < df["Lower2"])
     return df
 
-# ─── Rally leg detection ───────────────────────────────────────────────────
-def detect_rally_legs(df: pd.DataFrame, n: int = LEG_WINDOW) -> dict:
-    close = df["Close"]
-    lows  = df["Low"]  if "Low"  in df.columns else close
-    highs = df["High"] if "High" in df.columns else close
+# ─── Rally leg detection — ZigZag method ──────────────────────────────────
+def detect_rally_legs(df: pd.DataFrame, reversal_pct: float = 5.0) -> dict:
+    """
+    ZigZag-based rally leg detector.
 
-    swing_low_idx, swing_high_idx = [], []
-    for i in range(n, len(df) - n):
-        if lows.iloc[i]  == lows.iloc[i-n : i+n+1].min():  swing_low_idx.append(i)
-        if highs.iloc[i] == highs.iloc[i-n : i+n+1].max(): swing_high_idx.append(i)
+    Instead of looking N bars ahead/behind (which produces huge multi-month
+    legs on long charts), this tracks price direction and only confirms a new
+    pivot when price REVERSES by at least `reversal_pct` % from the last
+    confirmed peak or trough.
 
-    swing_lows  = df.iloc[swing_low_idx]  if swing_low_idx  else pd.DataFrame()
-    swing_highs = df.iloc[swing_high_idx] if swing_high_idx else pd.DataFrame()
+    reversal_pct guide:
+        3 %  →  very sensitive — short 2-4 week legs  (tight stops)
+        5 %  →  moderate       — 4-8 week legs         (good default)
+        8 %  →  relaxed        — 2-4 month legs
+       12 %  →  major swings   — multi-month legs only
+    """
+    close = df["Close"].squeeze()
+    highs = df["High"].squeeze() if "High" in df.columns else close
+    lows  = df["Low"].squeeze()  if "Low"  in df.columns else close
+    dates = df.index
+    n     = len(close)
 
-    events = (
-        [(df.index[i], "L", float(lows.iloc[i]))  for i in swing_low_idx] +
-        [(df.index[i], "H", float(highs.iloc[i])) for i in swing_high_idx]
-    )
-    events.sort(key=lambda x: x[0])
+    if n < 20:
+        return {"swing_lows": pd.DataFrame(), "swing_highs": pd.DataFrame(),
+                "legs": [], "prev_leg_low": None,
+                "current_leg_low": None, "current_leg_high": None,
+                "pivots": []}
 
-    clean = []
-    for date, kind, price in events:
-        if clean and clean[-1][1] == kind:
-            if (kind == "L" and price < clean[-1][2]) or (kind == "H" and price > clean[-1][2]):
-                clean[-1] = [date, kind, price]
-        else:
-            clean.append([date, kind, price])
+    # ── State machine ────────────────────────────────────────────────────
+    UP, DOWN = 1, -1
+    direction    = None
+    peak_idx     = 0;  peak_price   = float(highs.iloc[0])
+    trough_idx   = 0;  trough_price = float(lows.iloc[0])
+    pivots       = []   # confirmed pivots: (date, 'H'/'L', price)
 
-    legs, i = [], 0
-    while i < len(clean) - 1:
-        if clean[i][1] == "L" and clean[i+1][1] == "H":
-            ld, _, lp = clean[i]
-            hd, _, hp = clean[i+1]
-            legs.append({"low_date": ld, "low_price": lp,
-                         "high_date": hd, "high_price": hp,
-                         "gain_pct": (hp - lp) / lp * 100})
-            i += 2
-        else:
-            i += 1
+    for i in range(1, n):
+        h = float(highs.iloc[i])
+        l = float(lows.iloc[i])
 
+        if direction is None:
+            # Bootstrap: find which way the market first moves meaningfully
+            if h >= float(lows.iloc[0]) * (1 + reversal_pct / 100):
+                direction  = UP
+                peak_idx   = i;  peak_price = h
+            elif l <= float(highs.iloc[0]) * (1 - reversal_pct / 100):
+                direction   = DOWN
+                trough_idx  = i;  trough_price = l
+            continue
+
+        if direction == UP:
+            if h >= peak_price:                          # new local high
+                peak_idx = i;  peak_price = h
+            elif l <= peak_price * (1 - reversal_pct / 100):   # reversal down
+                pivots.append((dates[peak_idx], "H", peak_price))
+                direction   = DOWN
+                trough_idx  = i;  trough_price = l
+
+        else:  # DOWN
+            if l <= trough_price:                         # new local low
+                trough_idx = i;  trough_price = l
+            elif h >= trough_price * (1 + reversal_pct / 100):  # reversal up
+                pivots.append((dates[trough_idx], "L", trough_price))
+                direction  = UP
+                peak_idx   = i;  peak_price = h
+
+    # Add the final in-progress pivot
+    if direction == UP:
+        pivots.append((dates[peak_idx],   "H", peak_price))
+    elif direction == DOWN:
+        pivots.append((dates[trough_idx], "L", trough_price))
+
+    # ── Build legs (L → H pairs) ─────────────────────────────────────────
+    legs = []
+    for i in range(len(pivots) - 1):
+        d0, t0, p0 = pivots[i]
+        d1, t1, p1 = pivots[i + 1]
+        if t0 == "L" and t1 == "H":
+            legs.append({
+                "low_date":  d0, "low_price":  p0,
+                "high_date": d1, "high_price": p1,
+                "gain_pct":  (p1 - p0) / p0 * 100,
+            })
+
+    # ── Swing-low / swing-high DataFrames (for chart markers) ────────────
+    low_dates  = [d for d, t, _ in pivots if t == "L"]
+    high_dates = [d for d, t, _ in pivots if t == "H"]
+    low_prices  = [p for _, t, p in pivots if t == "L"]
+    high_prices = [p for _, t, p in pivots if t == "H"]
+
+    swing_lows  = pd.DataFrame({"Low":  low_prices},  index=low_dates)
+    swing_highs = pd.DataFrame({"High": high_prices}, index=high_dates)
+
+    # ── Stop-loss levels ─────────────────────────────────────────────────
     prev_leg_low = curr_leg_low = curr_leg_high = None
-    if legs:
-        prev_leg        = legs[-1]
-        prev_leg_low    = prev_leg
-        last_high_date  = prev_leg["high_date"]
-        post_lows       = [e for e in clean if e[0] > last_high_date and e[1] == "L"]
-        if post_lows:
-            cl = post_lows[-1]
-            curr_leg_low  = {"date": cl[0], "price": cl[2]}
-            curr_leg_high = float(close[close.index >= cl[0]].max())
-        else:
-            curr_leg_low  = {"date": prev_leg["low_date"], "price": prev_leg["low_price"]}
-            curr_leg_high = float(close[close.index >= prev_leg["low_date"]].max())
 
-    return {"swing_lows": swing_lows, "swing_highs": swing_highs,
-            "legs": legs, "prev_leg_low": prev_leg_low,
-            "current_leg_low": curr_leg_low, "current_leg_high": curr_leg_high}
+    if legs:
+        prev_leg_low   = legs[-1]          # most recent completed leg low = stop reference
+        last_confirmed = pivots[-1]
+
+        if last_confirmed[1] == "L":
+            # Currently IN an upleg — started at this trough
+            curr_leg_low  = {"date": last_confirmed[0], "price": last_confirmed[2]}
+            mask          = close.index >= last_confirmed[0]
+            curr_leg_high = float(close[mask].max()) if mask.any() else last_confirmed[2]
+        else:
+            # Completed a leg, now pulling back — use most recent trough
+            lows_list = [(d, p) for d, t, p in pivots if t == "L"]
+            if lows_list:
+                ld, lp        = lows_list[-1]
+                curr_leg_low  = {"date": ld, "price": lp}
+                mask          = close.index >= ld
+                curr_leg_high = float(close[mask].max()) if mask.any() else lp
+
+    return {
+        "swing_lows":      swing_lows,
+        "swing_highs":     swing_highs,
+        "legs":            legs,
+        "prev_leg_low":    prev_leg_low,
+        "current_leg_low": curr_leg_low,
+        "current_leg_high":curr_leg_high,
+        "pivots":          pivots,
+    }
 
 # ─── Beneish M-Score ──────────────────────────────────────────────────────
 def _row(df, *candidates):
@@ -337,15 +402,21 @@ def make_chart(sd_df, prices, legs_data, company, ticker):
         ax.scatter(alerts.index, alerts["Close"],
                    color="#f85149", s=30, zorder=5, label=f"⚠ 2σ Alert ({len(alerts)})")
 
-    # Swing markers
-    if not sw_lows.empty:
-        lp = sw_lows["Low"] if "Low" in sw_lows.columns else sw_lows["Close"]
-        ax.scatter(sw_lows.index, lp.squeeze(),
-                   marker="^", color="#3fb950", s=55, zorder=6, label="Swing Low")
-    if not sw_highs.empty:
-        hp = sw_highs["High"] if "High" in sw_highs.columns else sw_highs["Close"]
-        ax.scatter(sw_highs.index, hp.squeeze(),
-                   marker="v", color="#f85149", s=55, zorder=6, label="Swing High")
+    # Swing markers — ZigZag pivots
+    if not sw_lows.empty and "Low" in sw_lows.columns:
+        ax.scatter(sw_lows.index, sw_lows["Low"].squeeze(),
+                   marker="^", color="#3fb950", s=60, zorder=6, label="Swing Low ▲")
+    if not sw_highs.empty and "High" in sw_highs.columns:
+        ax.scatter(sw_highs.index, sw_highs["High"].squeeze(),
+                   marker="v", color="#f85149", s=60, zorder=6, label="Swing High ▼")
+
+    # Connect pivots with a thin ZigZag line for clarity
+    all_pivots = legs_data.get("pivots", [])
+    if all_pivots:
+        zz_dates  = [p[0] for p in all_pivots]
+        zz_prices = [p[2] for p in all_pivots]
+        ax.plot(zz_dates, zz_prices, color="#a371f7", lw=0.8,
+                ls="-", alpha=0.5, zorder=4, label="ZigZag")
 
     # Stop-loss horizontal line
     if prev_leg:
@@ -381,7 +452,7 @@ def make_chart(sd_df, prices, legs_data, company, ticker):
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════════════════
-for k in ["prices","financials","sd_df","legs_data","company","ticker"]:
+for k in ["prices","financials","sd_df","legs_data","company","ticker","reversal_pct"]:
     if k not in st.session_state:
         st.session_state[k] = None
 if "search_results" not in st.session_state:
@@ -439,6 +510,30 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Rally leg sensitivity ────────────────────────────────────────────
+    st.markdown("**📐 Rally Leg Sensitivity**")
+    sensitivity_label = st.select_slider(
+        "Reversal threshold",
+        options=["Very Short (3%)", "Short (5%)", "Medium (8%)", "Long (12%)"],
+        value="Short (5%)",
+        label_visibility="collapsed",
+    )
+    REVERSAL_MAP = {
+        "Very Short (3%)": 3.0,
+        "Short (5%)":      5.0,
+        "Medium (8%)":     8.0,
+        "Long (12%)":     12.0,
+    }
+    reversal_pct = REVERSAL_MAP[sensitivity_label]
+    st.caption({
+        "Very Short (3%)": "2-4 week legs · tightest stops",
+        "Short (5%)":      "4-8 week legs · good default",
+        "Medium (8%)":     "2-3 month legs · positional trades",
+        "Long (12%)":      "Major swings only · long-term view",
+    }[sensitivity_label])
+
+    st.divider()
+
     analyze_btn = st.button(
         "▶  Analyze",
         type="primary",
@@ -458,14 +553,15 @@ with st.sidebar:
                 for col in ["High", "Low"]:
                     if col in prices.columns:
                         merged[col] = prices[col].squeeze()
-                legs_data = detect_rally_legs(merged)
+                legs_data = detect_rally_legs(merged, reversal_pct=reversal_pct)
 
-                st.session_state.prices     = prices
-                st.session_state.financials = financials
-                st.session_state.sd_df      = sd_df
-                st.session_state.legs_data  = legs_data
-                st.session_state.company    = company_to_use
-                st.session_state.ticker     = ticker_to_use
+                st.session_state.prices       = prices
+                st.session_state.financials   = financials
+                st.session_state.sd_df        = sd_df
+                st.session_state.legs_data    = legs_data
+                st.session_state.company      = company_to_use
+                st.session_state.ticker       = ticker_to_use
+                st.session_state.reversal_pct = reversal_pct
             except Exception as e:
                 st.error(f"❌ {e}")
                 st.session_state.prices = None
@@ -578,10 +674,13 @@ else:
         curr_leg     = legs_data["current_leg_low"]
         curr_high    = legs_data["current_leg_high"]
         curr_price   = float(sd_df["Close"].iloc[-1])
+        used_reversal = st.session_state.get("reversal_pct", 5.0)
 
         if not legs:
             st.info("Not enough price history to detect rally legs. Try a longer period or a more liquid stock.")
         else:
+            st.caption(f"Detected using **{used_reversal:.0f}% ZigZag reversal** · "
+                       f"{len(legs)} legs found · adjust sensitivity in the sidebar and re-analyze")
             st.markdown("#### Detected Rally Legs")
             leg_rows = []
             for i, leg in enumerate(legs[-8:], 1):
